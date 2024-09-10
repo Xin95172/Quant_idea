@@ -70,7 +70,7 @@ def get_middle(df):
         
     return df
 
-def llt_strategy(df, feePaid, a, p, q, num_vol, rolling, distance_threshold, retrace_threshold):
+def llt_strategy(df, feePaid, a, p, q, num_vol, rolling, distance_threshold, retrace_threshold, offset_threshold):
     
     equity = pd.DataFrame(index = df.index)
 
@@ -80,6 +80,7 @@ def llt_strategy(df, feePaid, a, p, q, num_vol, rolling, distance_threshold, ret
         distance_threshold = distance_threshold, retrace_threshold = retrace_threshold)
 
     BS = None
+    highest = None
     t = 0
     df[['Bull', 'Bear']] = False
 
@@ -115,11 +116,9 @@ def llt_strategy(df, feePaid, a, p, q, num_vol, rolling, distance_threshold, ret
         condition6 = (df['bolinger_lower_smooth'].iloc[i] - df['bolinger_lower_smooth'].iloc[i - 1]) < 0 # 下軌向下
         
         entryLong = (df['llt_slope'].iloc[i] > 0) & (((df['upper_rise'].iloc[i] == True) & condition1) | ((df['lower_rise'].iloc[i] == True) & condition2))
-        # exitLong = ((df['bolinger_upper'].iloc[i] < df['bolinger_upper_smooth'].iloc[i]) & condition1 & condition4) | ((df['bolinger_lower'].iloc[i] < df['bolinger_lower_smooth'].iloc[i]) & condition2 & condition6) | (df['close'].iloc[i] < df['buy_price'].iloc[t])
-        exitLong = df['llt_slope'] < 0
+        # exitLong = (df['close'].iloc[i] < df['llt'].iloc[i])
         entryShort = (df['llt_slope'].iloc[i] < 0) & (((df['upper_down'].iloc[i] == True) & condition1) | ((df['lower_down'].iloc[i] == True) & condition2))
-        # exitShort = ((df['bolinger_upper'].iloc[i] > df['bolinger_upper_smooth'].iloc[i]) & condition1 & condition3) | ((df['bolinger_lower'].iloc[i] > df['bolinger_lower_smooth'].iloc[i]) & condition2 & condition5) | (df['close'].iloc[i] > df['short_price'].iloc[t])
-        exitShort = df['lly_slope'] > 0
+        # exitShort = (df['close'].iloc[i] > df['llt'].iloc[i])
         
         df.at[df.index[i], 'Bull'] = (condition1 & condition3) | (condition2 & condition5)
         df.at[df.index[i], 'Bear'] = (condition1 & condition4) | (condition2 & condition6)
@@ -128,6 +127,7 @@ def llt_strategy(df, feePaid, a, p, q, num_vol, rolling, distance_threshold, ret
             if df['Bull'].iloc[i]:
                 if entryLong:
                     BS = 'B'
+                    highest = df['open'].iloc[t]
                     t = i + 1
                     df.at[df.index[t], 'buy'] = t
                     df.at[df.index[t], 'buy_price'] = df['open'].iloc[t]
@@ -137,19 +137,21 @@ def llt_strategy(df, feePaid, a, p, q, num_vol, rolling, distance_threshold, ret
             elif df['Bear'].iloc[i]:
                 if entryShort:
                     BS = 'S'
+                    highest = df['open'].iloc[t]
                     t = i + 1
                     df.at[df.index[t], 'sellshort'] = t
                     df.at[df.index[t], 'short_price'] = df['open'].iloc[t]
                     df.at[df.index[t], 'sellshort_time'] = df.index[t]
                     df.at[df.index[t], 'position'] -= 1
-
+                    
         elif BS == 'B':
-                
+            
+            highest = max(highest, df['open'].iloc[i - 1])
             df.at[df.index[i + 1], 'position'] = df.at[df.index[i], 'position']
             profit = 200 * (df['open'].iloc[i + 1] - df['open'].iloc[i]) * df['position'].iloc[i + 1]
             df.at[df.index[i], 'profit_list'] = profit
 
-            if exitLong:
+            if df['close'].iloc[i] < (highest * (1 - offset_threshold)):
                 pl_round = 200 * (df['open'].iloc[i + 1] - df['open'].iloc[t]) * df['position'].iloc[i]
                 profit_fee = profit - feePaid * 2
                 df.at[df.index[i + 1], 'position'] -= 1
@@ -159,6 +161,7 @@ def llt_strategy(df, feePaid, a, p, q, num_vol, rolling, distance_threshold, ret
                 df.at[df.index[i + 1], 'hold_duration'] = pd.date_range(start = df.index[t], end = df.index[i], freq = 'B').size
                 df.at[df.index[i + 1], 'sell'] = i + 1
                 BS = None
+                highest = None
 
                 df.at[df.index[i + 1], 'profit_fee_list_realized'] = pl_round - feePaid * 2
 
@@ -174,6 +177,7 @@ def llt_strategy(df, feePaid, a, p, q, num_vol, rolling, distance_threshold, ret
                     df.at[df.index[i + 1], 'hold_duration'] = pd.date_range(start = df.index[t], end = df.index[i], freq = 'B').size
                     df.at[df.index[i + 1], 'sell'] = i + 1
                     BS = None
+                    highest = None
 
             else:
                 profit_fee = profit
@@ -181,11 +185,12 @@ def llt_strategy(df, feePaid, a, p, q, num_vol, rolling, distance_threshold, ret
 
         elif BS == 'S':
             
+            highest = min(highest, df['open'].iloc[i])
             df.at[df.index[i + 1], 'position'] = df.at[df.index[i], 'position']
             profit = 200 * (df['open'].iloc[i + 1] - df['open'].iloc[i]) * df['position'].iloc[i + 1]
             df.at[df.index[i], 'profit_list'] = profit
 
-            if exitShort:
+            if df['close'].iloc[i] > (highest * (1 + offset_threshold)):
                 pl_round = 200 * (df['open'].iloc[i + 1] - df['open'].iloc[t]) * df['position'].iloc[i]
                 profit_fee = profit - feePaid * 2
                 df.at[df.index[i + 1], 'position'] += 1
@@ -195,6 +200,7 @@ def llt_strategy(df, feePaid, a, p, q, num_vol, rolling, distance_threshold, ret
                 df.at[df.index[i + 1], 'hold_duration'] = pd.date_range(start = df.index[t], end = df.index[i], freq = 'B').size
                 df.at[df.index[i + 1], 'buytocover'] = i + 1
                 BS = None
+                highest = None
 
                 profit_fee_realized = pl_round - feePaid * 2
                 df.at[df.index[i + 1], 'profit_fee_list_realized'] = profit_fee_realized
@@ -211,6 +217,8 @@ def llt_strategy(df, feePaid, a, p, q, num_vol, rolling, distance_threshold, ret
                     df.at[df.index[i + 1], 'hold_duration'] = pd.date_range(start = df.index[t], end = df.index[i], freq = 'B').size
                     df.at[df.index[i + 1], 'buytocover'] = i + 1
                     BS = None
+                    highest = None
+
             else:
                 profit_fee = profit
                 df.at[df.index[i], 'profit_fee_list'] = profit_fee
