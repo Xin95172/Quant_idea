@@ -7,3 +7,4 @@ data/disposal/price_df.csv
 **/data
 .DS_Store
 /projects/CTA/學弟策略/feature_df.parquet
+/projects/TX/rubber_band_diagnostics.xlsx
