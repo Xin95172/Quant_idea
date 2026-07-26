@@ -1319,20 +1319,24 @@ class TXAnalyzer:
     def indicator_night_ret(
         self,
         sub_analysis: bool = False,
+        window: int = 3,
         *,
         return_series: bool = False,
         add_to_df: bool = False,
         percentile: float | None = None,
         side: str = 'low',
     ):
-        """Plot or return the prior night-session close versus its 3-day MA divergence."""
+        """Plot or return night-session close divergence from its trailing MA."""
         if sub_analysis and (return_series or add_to_df or percentile is not None):
             raise ValueError('sub_analysis cannot be used with return_series, add_to_df, or percentile')
+        if window < 2:
+            raise ValueError('window must be at least 2')
         df = self.df.copy()
-        df['3_ma'] = df['Close_a'].rolling(3).mean()
-        df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
+        factor_name = 'night_ret_divergence' if window == 3 else f'night_ret_divergence_{window}'
+        df['night_ret_ma'] = df['Close_a'].rolling(window).mean()
+        df['divergence'] = (df['Close_a'] / df['night_ret_ma']) - 1
         df = df.dropna(subset=['divergence'])
-        result = self._handle_indicator_output(df['divergence'], name='night_ret_divergence', return_series=return_series, add_to_df=add_to_df, percentile=percentile, side=side)
+        result = self._handle_indicator_output(df['divergence'], name=factor_name, return_series=return_series, add_to_df=add_to_df, percentile=percentile, side=side)
         if result is not None:
             return result
         if sub_analysis:
@@ -1350,6 +1354,51 @@ class TXAnalyzer:
         df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
         df['cum_daily_ret'] = df['daily_ret'].cumsum()
         return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret'], title='night_ret')
+
+    def indicator_night_ret_divergence(
+        self,
+        window: int = 3,
+        *,
+        return_series: bool = False,
+        add_to_df: bool = False,
+        percentile: float | None = None,
+        side: str = 'low',
+    ):
+        """Measure night-session return relative to its trailing mean return.
+
+        ``daily_ret_a`` is the night-session open-to-close return.  Under the
+        analyzer's close-date convention, the night session labelled ``t``
+        ends before day session ``t`` opens, so this factor needs no extra
+        shift when it predicts ``daily_ret[t]``.
+        """
+        if window < 2:
+            raise ValueError('window must be at least 2')
+
+        df = self.df.copy()
+        factor_name = f'night_ret_divergence_{window}'
+        df[factor_name] = df['daily_ret_a'] - df['daily_ret_a'].rolling(window).mean()
+        result = self._handle_indicator_output(
+            df[factor_name],
+            name=factor_name,
+            return_series=return_series,
+            add_to_df=add_to_df,
+            percentile=percentile,
+            side=side,
+        )
+        if result is not None:
+            return result
+
+        df = df.dropna(subset=[factor_name]).sort_values(by=factor_name).reset_index(drop=True)
+        df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
+        df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
+        df['cum_daily_ret'] = df['daily_ret'].cumsum()
+        return plot.plot(
+            df,
+            ly=['cum_demeaned_daily_ret'],
+            ry=factor_name,
+            sub_ly=['cum_daily_ret'],
+            title=factor_name,
+        )
 
     def indicator_spread(self, window: int = 5, *, return_series: bool = False, add_to_df: bool = False, percentile: float | None = None, side: str = 'low'):
         df = self.df.copy()
@@ -1846,128 +1895,106 @@ class TXAnalyzer:
     # Factor research tools: conditional sorts, signal timelines, and overlap
     # =========================================================================
     @staticmethod
-    def double_sort_thresholds(
-        primary: pd.Series,
-        secondary: pd.Series,
-        *,
-        primary_percentile_range: tuple[float, float],
-        secondary_percentile: float | tuple[float, float],
-    ) -> pd.Series:
-        """Convert a conditional two-factor percentile rule into raw cutoffs.
-
-        First retain observations whose ``primary`` value is inside the given
-        percentile range. Then calculate a ``secondary`` percentile cutoff
-        (or range) within those retained observations. A scalar secondary
-        percentile means the left-tail range ``(0, percentile)``; a tuple
-        explicitly selects ``(lower, upper)``. This is a sequential
-        (conditional) double sort, not a product of two factors.
-
-        All inputs should be restricted to the training period before calling
-        this method. Percentiles use the 0--100 convention.
-        """
-        lower_pct, upper_pct = map(float, primary_percentile_range)
-        if not 0 <= lower_pct < upper_pct <= 100:
-            raise ValueError('primary_percentile_range must satisfy 0 <= lower < upper <= 100')
-        if isinstance(secondary_percentile, tuple):
-            secondary_lower_pct, secondary_upper_pct = map(float, secondary_percentile)
-        else:
-            secondary_lower_pct, secondary_upper_pct = 0.0, float(secondary_percentile)
-        if not 0 <= secondary_lower_pct < secondary_upper_pct <= 100:
-            raise ValueError('secondary_percentile must satisfy 0 <= lower < upper <= 100')
-
-        frame = pd.concat(
-            {'primary': primary, 'secondary': secondary},
-            axis=1,
-        ).dropna()
-        if frame.empty:
-            raise ValueError('no overlapping non-null observations are available')
-
-        primary_lower = float(frame['primary'].quantile(lower_pct / 100))
-        primary_upper = float(frame['primary'].quantile(upper_pct / 100))
-        selected = frame.loc[frame['primary'].between(primary_lower, primary_upper, inclusive='both')]
-        if selected.empty:
-            raise ValueError('the primary percentile range selected no observations')
-
-        secondary_lower = float(selected['secondary'].quantile(secondary_lower_pct / 100))
-        secondary_upper = float(selected['secondary'].quantile(secondary_upper_pct / 100))
-        return pd.Series({
-            'primary_lower_percentile': lower_pct,
-            'primary_upper_percentile': upper_pct,
-            'primary_lower_cutoff': primary_lower,
-            'primary_upper_cutoff': primary_upper,
-            'secondary_lower_percentile': secondary_lower_pct,
-            'secondary_upper_percentile': secondary_upper_pct,
-            'secondary_lower_cutoff': secondary_lower,
-            'secondary_upper_cutoff': secondary_upper,
-            'observations': len(frame),
-            'selected_observations': len(selected),
-        }, name='double_sort_thresholds')
-
-    @staticmethod
-    def percentile_thresholds(
+    def fit_factor_thresholds(
         values: pd.Series,
         percentile_range: float | tuple[float, float],
+        *,
+        condition: pd.Series | None = None,
+        condition_percentile_range: float | tuple[float, float] | None = None,
     ) -> pd.Series:
-        """Convert a training-sample percentile range into fixed raw cutoffs.
+        """Fit fixed raw factor cutoffs on a training sample.
 
-        A scalar ``p`` means the left-tail range ``(0, p)``. A tuple selects
-        an explicit percentile interval, e.g. ``(80, 100)``. Pass only the
-        training portion of a factor to avoid leaking future information.
+        A scalar percentile means the left-tail interval ``(0, p)``; a tuple
+        selects an explicit interval. When ``condition`` and
+        ``condition_percentile_range`` are supplied, first select the
+        condition interval and then fit the factor cutoffs within it. All
+        inputs should be restricted to the training sample before calling.
         """
-        if isinstance(percentile_range, tuple):
-            lower_pct, upper_pct = map(float, percentile_range)
-        else:
-            lower_pct, upper_pct = 0.0, float(percentile_range)
-        if not 0 <= lower_pct < upper_pct <= 100:
-            raise ValueError('percentile_range must satisfy 0 <= lower < upper <= 100')
+        def normalize_range(
+            raw_range: float | tuple[float, float],
+            *,
+            parameter_name: str,
+        ) -> tuple[float, float]:
+            if isinstance(raw_range, tuple):
+                lower, upper = map(float, raw_range)
+            else:
+                lower, upper = 0.0, float(raw_range)
+            if not 0 <= lower < upper <= 100:
+                raise ValueError(f'{parameter_name} must satisfy 0 <= lower < upper <= 100')
+            return lower, upper
 
-        clean = values.dropna()
-        if clean.empty:
-            raise ValueError('no valid observations are available')
+        lower_pct, upper_pct = normalize_range(percentile_range, parameter_name='percentile_range')
+        if condition is None:
+            if condition_percentile_range is not None:
+                raise ValueError('condition_percentile_range requires condition')
+            selected = values.dropna()
+            condition_thresholds = {}
+            observations = len(selected)
+        else:
+            if condition_percentile_range is None:
+                raise ValueError('condition requires condition_percentile_range')
+            condition_lower_pct, condition_upper_pct = normalize_range(
+                condition_percentile_range,
+                parameter_name='condition_percentile_range',
+            )
+            frame = pd.concat({'factor': values, 'condition': condition}, axis=1).dropna()
+            if frame.empty:
+                raise ValueError('no overlapping non-null observations are available')
+            condition_lower = float(frame['condition'].quantile(condition_lower_pct / 100))
+            condition_upper = float(frame['condition'].quantile(condition_upper_pct / 100))
+            selected = frame.loc[
+                frame['condition'].between(condition_lower, condition_upper, inclusive='both'),
+                'factor',
+            ]
+            if selected.empty:
+                raise ValueError('the condition percentile range selected no observations')
+            condition_thresholds = {
+                'condition_lower_percentile': condition_lower_pct,
+                'condition_upper_percentile': condition_upper_pct,
+                'condition_lower_cutoff': condition_lower,
+                'condition_upper_cutoff': condition_upper,
+                'observations_before_condition': len(frame),
+            }
+            observations = len(selected)
+
         return pd.Series({
             'lower_percentile': lower_pct,
             'upper_percentile': upper_pct,
-            'lower_cutoff': float(clean.quantile(lower_pct / 100)),
-            'upper_cutoff': float(clean.quantile(upper_pct / 100)),
-            'observations': len(clean),
-        }, name=values.name or 'percentile_thresholds')
+            'lower_cutoff': float(selected.quantile(lower_pct / 100)),
+            'upper_cutoff': float(selected.quantile(upper_pct / 100)),
+            **condition_thresholds,
+            'observations': observations,
+        }, name=values.name or 'factor_thresholds')
 
     @staticmethod
-    def threshold_signal(values: pd.Series, thresholds: pd.Series) -> pd.Series:
-        """Build a nullable signal from fixed lower/upper cutoff values."""
+    def threshold_signal(
+        values: pd.Series,
+        thresholds: pd.Series,
+        *,
+        condition: pd.Series | None = None,
+    ) -> pd.Series:
+        """Build a nullable signal from fixed factor and optional condition cutoffs."""
         required = {'lower_cutoff', 'upper_cutoff'}
         if not required.issubset(thresholds.index):
             raise ValueError(f'thresholds must contain: {sorted(required)}')
-        return values.between(
+        signal = values.between(
             thresholds['lower_cutoff'],
             thresholds['upper_cutoff'],
             inclusive='both',
-        ).where(values.notna())
-
-    @staticmethod
-    def double_sort_signal(
-        primary: pd.Series,
-        secondary: pd.Series,
-        thresholds: pd.Series,
-    ) -> pd.Series:
-        """Build a nullable signal from fixed ``double_sort_thresholds`` cutoffs."""
-        required = {
-            'primary_lower_cutoff', 'primary_upper_cutoff',
-            'secondary_lower_cutoff', 'secondary_upper_cutoff',
-        }
-        if not required.issubset(thresholds.index):
-            raise ValueError(f'thresholds must contain: {sorted(required)}')
-        available = primary.notna() & secondary.notna()
-        return (
-            primary.between(
-                thresholds['primary_lower_cutoff'],
-                thresholds['primary_upper_cutoff'], inclusive='both',
+        )
+        condition_required = {'condition_lower_cutoff', 'condition_upper_cutoff'}
+        if condition_required.issubset(thresholds.index):
+            if condition is None:
+                raise ValueError('condition is required by these thresholds')
+            signal &= condition.between(
+                thresholds['condition_lower_cutoff'],
+                thresholds['condition_upper_cutoff'],
+                inclusive='both',
             )
-            & secondary.between(
-                thresholds['secondary_lower_cutoff'],
-                thresholds['secondary_upper_cutoff'], inclusive='both',
-            )
-        ).where(available)
+            return signal.where(values.notna() & condition.notna())
+        if condition is not None:
+            raise ValueError('condition was provided but thresholds have no condition cutoffs')
+        return signal.where(values.notna())
 
     @staticmethod
     def signal_overlap_diagnostics(
@@ -2311,7 +2338,7 @@ class TXAnalyzer:
 
         raw_factors = pd.concat(factor_map, axis=1).sort_index()
         thresholds = pd.DataFrame({
-            name: TXAnalyzer.percentile_thresholds(
+            name: TXAnalyzer.fit_factor_thresholds(
                 factor.loc[:pd.Timestamp(training_end)],
                 percentile_map[name],
             )
