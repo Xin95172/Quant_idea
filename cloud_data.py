@@ -1,14 +1,11 @@
-from pathlib import Path
-import os
 import urllib.request
+
+from pathlib import Path
 
 import pandas as pd
 
+from project_paths import DATA_ROOT, NOTE_REPO_ROOT
 
-DATA_ROOT = Path(os.environ.get("DATA_ROOT", "/Users/xinc/GitHub/google_drive/Data"))
-NOTE_REPO_ROOT = Path(
-    os.environ.get("DATA_DOWNLOAD_OWNER_ROOT", "/Users/xinc/GitHub/note")
-)
 
 
 class QuantRemoteDownloadBlocked(RuntimeError):
@@ -30,9 +27,9 @@ def remote_download_allowed() -> bool:
 
 def _block_message() -> str:
     return (
-        "Remote data download is blocked in /Users/xinc/GitHub/Quant. "
-        "Run data update workflows from /Users/xinc/GitHub/note, then read "
-        "the synced files under /Users/xinc/GitHub/google_drive/Data."
+        f"Remote data download is blocked in {Path(__file__).resolve().parent}. "
+        f"Run data update workflows from {NOTE_REPO_ROOT}, then read "
+        f"the synced files under {DATA_ROOT}."
     )
 
 

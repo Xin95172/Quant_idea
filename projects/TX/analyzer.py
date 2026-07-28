@@ -8,6 +8,7 @@ import module.plot_func as plot
 import plotly.graph_objects as go
 from IPython.display import display
 from cloud_data import MARKET_FEAR_GREED
+from project_paths import NOTE_REPO_ROOT
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -579,7 +580,7 @@ class TXAnalyzer:
         if not MARKET_FEAR_GREED.exists():
             raise FileNotFoundError(
                 f'{MARKET_FEAR_GREED} is missing. Update it from '
-                '/Users/xinc/GitHub/note.'
+                f'{NOTE_REPO_ROOT}.'
             )
         return pd.read_parquet(MARKET_FEAR_GREED)
 
