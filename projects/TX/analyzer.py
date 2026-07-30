@@ -119,6 +119,24 @@ class TXAnalyzer:
             self.df[f'cum_{return_column}'] = self.df[return_column].cumsum()
             self.df[pnl_column] = self.df[close_column] - self.df[open_column]
             self.df[f'cum_{pnl_column}'] = self.df[pnl_column].cumsum()
+
+    @staticmethod
+    def _prepare_return_curves(
+        df: pd.DataFrame,
+        *,
+        sort_by: str,
+        return_columns: tuple[str, ...] = ('daily_ret_a', 'daily_ret'),
+    ) -> pd.DataFrame:
+        """Sort by a factor and add demeaned and cumulative return curves."""
+        frame = df.sort_values(by=sort_by).reset_index(drop=True).copy()
+
+        for column in return_columns:
+            demeaned_column = f'demeaned_{column}'
+            frame[demeaned_column] = frame[column] - frame[column].mean()
+            frame[f'cum_{demeaned_column}'] = frame[demeaned_column].cumsum()
+            frame[f'cum_{column}'] = frame[column].cumsum()
+
+        return frame
     
     # =========================================================================
     # Configuration, data views, and summary helpers
@@ -242,9 +260,9 @@ class TXAnalyzer:
         train_ratio: float = 0.6,
         validation_ratio: float = 0.2,
     ) -> dict[str, pd.Timestamp]:
-        """Split ordered trading dates into train, validation, and test periods."""
-        if train_ratio <= 0 or validation_ratio <= 0 or train_ratio + validation_ratio >= 1:
-            raise ValueError('train_ratio and validation_ratio must be positive and sum to less than 1')
+        """Split ordered trading dates into train, optional validation, and test periods."""
+        if train_ratio <= 0 or validation_ratio < 0 or train_ratio + validation_ratio >= 1:
+            raise ValueError('train_ratio must be positive; validation_ratio must be non-negative; their sum must be less than 1')
 
         dates = pd.DatetimeIndex(pd.to_datetime(index)).normalize().unique().sort_values()
         if start is not None:
@@ -253,16 +271,18 @@ class TXAnalyzer:
             raise ValueError('at least three trading dates are required to create train, validation, and test periods')
 
         train_count = max(1, int(len(dates) * train_ratio))
-        validation_count = max(1, int(len(dates) * validation_ratio))
+        validation_count = int(len(dates) * validation_ratio)
         if train_count + validation_count >= len(dates):
             raise ValueError('split ratios leave no trading dates for the test period')
 
-        return {
+        split = {
             'train_end': dates[train_count - 1],
-            'validation_start': dates[train_count],
-            'validation_end': dates[train_count + validation_count - 1],
             'test_start': dates[train_count + validation_count],
         }
+        if validation_count:
+            split['validation_start'] = dates[train_count]
+            split['validation_end'] = dates[train_count + validation_count - 1]
+        return split
     
     def display_df(self) -> pd.DataFrame:
         return self.df
@@ -427,28 +447,41 @@ class TXAnalyzer:
         day_df: pd.DataFrame,
         night_df: pd.DataFrame,
     ) -> pd.DataFrame:
-        """Convert day and night institutional option data into strategy signals."""
-        if day_df.empty:
-            day_signal = pd.DataFrame(columns=['Foreign_Opt_Signal', 'Dealer_Opt_Signal'])
-        else:
-            required_columns = {'date', 'call_put', 'institutional_investors', 'long_deal_amount', 'short_deal_amount'}
-            missing_columns = required_columns - set(day_df.columns)
-            if missing_columns:
-                raise KeyError(f"day option data missing columns: {sorted(missing_columns)}")
+        """Convert institutional option data into day and night strategy signals.
 
-            day_data = day_df.copy()
-            day_data['date'] = pd.to_datetime(day_data['date']).dt.normalize()
-            day_data['call_put'] = day_data['call_put'].replace({
+        Supports both the current long-form parquet schema (one row per date,
+        institution, and CALL/PUT) and the legacy files retained for notebooks.
+        """
+        long_form_columns = {
+            'date', 'call_put', 'institutional_investor',
+            'buy_amount_thousand', 'sell_amount_thousand',
+        }
+
+        def build_long_form_signal(frame: pd.DataFrame, suffix: str = '') -> pd.DataFrame:
+            if frame.empty:
+                return pd.DataFrame(columns=[
+                    f'Foreign_Opt_Signal{suffix}', f'Dealer_Opt_Signal{suffix}',
+                ])
+
+            missing_columns = long_form_columns - set(frame.columns)
+            if missing_columns:
+                raise KeyError(f"option data missing columns: {sorted(missing_columns)}")
+
+            data = frame.copy()
+            data['date'] = pd.to_datetime(data['date']).dt.normalize()
+            data['call_put'] = data['call_put'].replace({
                 '買權': 'CALL', '賣權': 'PUT', 'Call': 'CALL', 'Put': 'PUT',
+            }).str.upper()
+            data['institution'] = data['institutional_investor'].replace({
+                '外資及陸資': 'Foreign', '外資': 'Foreign', 'Foreign': 'Foreign',
+                '自營商': 'Dealer', 'Dealer': 'Dealer',
             })
-            day_data['net_amount'] = day_data['long_deal_amount'] - day_data['short_deal_amount']
-            day_data['turnover'] = day_data['long_deal_amount'] + day_data['short_deal_amount']
-            pivot = day_data.pivot_table(
-                index='date',
-                columns=['institutional_investors', 'call_put'],
-                values=['net_amount', 'turnover'],
-                aggfunc='sum',
-                fill_value=0,
+            data = data.loc[data['institution'].isin(['Foreign', 'Dealer'])]
+            data['net_amount'] = data['buy_amount_thousand'] - data['sell_amount_thousand']
+            data['turnover'] = data['buy_amount_thousand'] + data['sell_amount_thousand']
+            pivot = data.pivot_table(
+                index='date', columns=['institution', 'call_put'],
+                values=['net_amount', 'turnover'], aggfunc='sum', fill_value=0,
             )
 
             def signal_for(institution: str) -> pd.Series:
@@ -458,21 +491,45 @@ class TXAnalyzer:
                 put_turnover = pivot.get(('turnover', institution, 'PUT'), pd.Series(0, index=pivot.index))
                 return (net_call - net_put) / (call_turnover + put_turnover).replace(0, np.nan)
 
-            day_signal = pd.DataFrame(index=pivot.index)
-            day_signal['Foreign_Opt_Signal'] = signal_for('外資')
-            day_signal['Dealer_Opt_Signal'] = signal_for('自營商')
+            return pd.DataFrame({
+                f'Foreign_Opt_Signal{suffix}': signal_for('Foreign'),
+                f'Dealer_Opt_Signal{suffix}': signal_for('Dealer'),
+            })
+
+        if long_form_columns.issubset(day_df.columns) and long_form_columns.issubset(night_df.columns):
+            return build_long_form_signal(day_df).join(build_long_form_signal(night_df, '_a'), how='outer')
+
+        # Legacy day/night schemas retained for existing historical notebooks.
+        if day_df.empty:
+            day_signal = pd.DataFrame(columns=['Foreign_Opt_Signal', 'Dealer_Opt_Signal'])
+        else:
+            required_columns = {'date', 'call_put', 'institutional_investors', 'long_deal_amount', 'short_deal_amount'}
+            missing_columns = required_columns - set(day_df.columns)
+            if missing_columns:
+                raise KeyError(f"day option data missing columns: {sorted(missing_columns)}")
+            day_data = day_df.copy()
+            day_data['date'] = pd.to_datetime(day_data['date']).dt.normalize()
+            day_data['call_put'] = day_data['call_put'].replace({'買權': 'CALL', '賣權': 'PUT', 'Call': 'CALL', 'Put': 'PUT'})
+            day_data['net_amount'] = day_data['long_deal_amount'] - day_data['short_deal_amount']
+            day_data['turnover'] = day_data['long_deal_amount'] + day_data['short_deal_amount']
+            pivot = day_data.pivot_table(index='date', columns=['institutional_investors', 'call_put'], values=['net_amount', 'turnover'], aggfunc='sum', fill_value=0)
+
+            def legacy_signal_for(institution: str) -> pd.Series:
+                net_call = pivot.get(('net_amount', institution, 'CALL'), pd.Series(0, index=pivot.index))
+                net_put = pivot.get(('net_amount', institution, 'PUT'), pd.Series(0, index=pivot.index))
+                call_turnover = pivot.get(('turnover', institution, 'CALL'), pd.Series(0, index=pivot.index))
+                put_turnover = pivot.get(('turnover', institution, 'PUT'), pd.Series(0, index=pivot.index))
+                return (net_call - net_put) / (call_turnover + put_turnover).replace(0, np.nan)
+
+            day_signal = pd.DataFrame({'Foreign_Opt_Signal': legacy_signal_for('外資'), 'Dealer_Opt_Signal': legacy_signal_for('自營商')})
 
         if night_df.empty:
             night_signal = pd.DataFrame(columns=['Foreign_Opt_Signal_a'])
         else:
-            required_columns = {
-                'foreign_long_call_amount', 'foreign_short_call_amount',
-                'foreign_long_put_amount', 'foreign_short_put_amount',
-            }
+            required_columns = {'foreign_long_call_amount', 'foreign_short_call_amount', 'foreign_long_put_amount', 'foreign_short_put_amount'}
             missing_columns = required_columns - set(night_df.columns)
             if missing_columns:
                 raise KeyError(f"night option data missing columns: {sorted(missing_columns)}")
-
             night_data = night_df.copy()
             night_data.index = pd.to_datetime(night_data.index).normalize()
             net_call = night_data['foreign_long_call_amount'] - night_data['foreign_short_call_amount']
@@ -1304,15 +1361,46 @@ class TXAnalyzer:
         if result is not None:
             return result
 
+        temp_df = self._prepare_return_curves(temp_df, sort_by='hist_vol')
+        return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='hist_vol', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title=f'{window}d_hist_vol')
+
+    def indicator_HL_vol(
+        self,
+        window: int = 20,
+        *,
+        percentile: float | None = None,
+        side: str = 'low',
+        return_series: bool = False,
+        add_to_df: bool = False,
+    ):
+        if window < 2:
+            raise ValueError('window must be at least 2')
+        temp_df = self.df.copy()
+        temp_df['HL_vol'] = temp_df['High'] / temp_df['Low'] - 1
+        temp_df['HL_vol_ma'] = temp_df['HL_vol'].rolling(window=window).mean()
+        temp_df['HL_vol'] = temp_df['HL_vol'] - temp_df['HL_vol_ma']
+        temp_df['HL_vol'] = temp_df['HL_vol'].shift(1)
+        temp_df = temp_df.dropna(subset=['HL_vol'])
+        result = self._handle_indicator_output(
+            temp_df['HL_vol'],
+            name=f'HL_vol_{window}',
+            return_series=return_series,
+            add_to_df=add_to_df,
+            percentile=percentile,
+            side=side,
+        )
+        if result is not None:
+            return result
+
         temp_df['demeaned_daily_ret_a'] = temp_df['daily_ret_a'] - temp_df['daily_ret_a'].mean()
         temp_df['demeaned_daily_ret'] = temp_df['daily_ret'] - temp_df['daily_ret'].mean()
 
-        temp_df = temp_df.sort_values(by='hist_vol').reset_index(drop=True)
+        temp_df = temp_df.sort_values(by='HL_vol').reset_index(drop=True)
         temp_df['cum_demeaned_daily_ret_a'] = temp_df['demeaned_daily_ret_a'].cumsum()
         temp_df['cum_demeaned_daily_ret'] = temp_df['demeaned_daily_ret'].cumsum()
         temp_df['cum_daily_ret_a'] = temp_df['daily_ret_a'].cumsum()
         temp_df['cum_daily_ret'] = temp_df['daily_ret'].cumsum()
-        return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='hist_vol', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title=f'{window}d_hist_vol')
+        return plot.plot(temp_df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='HL_vol', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title=f'{window}d_HL_vol')
 
     # =========================================================================
     # Factor diagnostics: price structure and macro markets
@@ -2881,6 +2969,9 @@ class TXAnalyzer:
         factor_name: str | None = None,
         conditions: list[dict] | None = None,
         position: float = 1.0,
+        one_way_cost: float = 0.0,
+        thresholds: pd.Series | dict | None = None,
+        session: str | None = None,
         show_metrics: bool = True,
     ) -> pd.DataFrame:
         """Plot when a selected factor condition occurs over time.
@@ -2894,12 +2985,12 @@ class TXAnalyzer:
         all conditions have selected their samples.
 
         Pass ``factor_percentile=(80, 100)`` to select a closed percentile range.
-        The returned frame contains only signal dates. With ``show_metrics=True``,
-        display strategy metrics for ``position`` held only on signal dates.
-        Use ``position=1`` for long, ``position=-1`` for short, and another
-        numeric value to test a different position size. Annual turnover is
-        calculated from signal entries and exits. The timeline itself always
-        shows raw ``return_column`` values, independent of ``position``.
+        Thresholds are fitted as raw quantile cutoffs (or supplied through
+        ``thresholds``) and the returned frame contains only signal dates.
+        With ``show_metrics=True``, performance is calculated by the same
+        position, turnover, and transaction-cost engine as the formal
+        threshold backtest.  ``session`` defaults to ``'day'`` for
+        ``daily_ret`` and ``'night'`` for ``daily_ret_a``.
         """
         from plotly.subplots import make_subplots
 
@@ -2907,6 +2998,12 @@ class TXAnalyzer:
             raise ValueError('ma_window must be at least 2')
         if not isinstance(position, (int, float, np.number)) or not np.isfinite(position) or position == 0:
             raise ValueError('position must be a finite non-zero number')
+        if one_way_cost < 0:
+            raise ValueError('one_way_cost must be non-negative')
+        if session is None:
+            session = {'daily_ret': 'day', 'daily_ret_a': 'night'}.get(return_column)
+        if session not in {'day', 'night'}:
+            raise ValueError("session must be 'day' or 'night'; specify it for a custom return_column")
         if return_column not in self.df:
             raise KeyError(f"missing return column: {return_column}")
         if conditions is not None and not isinstance(conditions, list):
@@ -2939,9 +3036,9 @@ class TXAnalyzer:
         return_label = return_column
         factor_values = factor_series
         condition_summary = []
+        condition_columns = []
         if conditions:
             frame = pd.DataFrame({'factor': factor_values, 'return': returns})
-            condition_columns = []
             for index, condition in enumerate(conditions, start=1):
                 if not isinstance(condition, dict):
                     raise TypeError('each condition must be a dictionary')
@@ -3001,12 +3098,40 @@ class TXAnalyzer:
             regime_label = 'without conditions'
             percentile_context = ''
 
+        # Use the same fixed-cutoff mechanism as ``backtest_threshold_rules``.
+        # Ranking is retained only for the chart label; it does not decide a
+        # trade, because rank-based ties can disagree with quantile cutoffs.
+        if thresholds is None:
+            if len(condition_columns) > 1:
+                raise ValueError(
+                    'formal timeline metrics support at most one condition; '
+                    'pass fixed thresholds or use one condition'
+                )
+            if condition_columns:
+                column, _, lower, upper = condition_columns[0]
+                fitted_thresholds = self.fit_factor_thresholds(
+                    frame['factor'],
+                    (percentile_lower, percentile_upper),
+                    condition=frame[column],
+                    condition_percentile_range=(lower, upper),
+                )
+                signal_mask = self.threshold_signal(
+                    frame['factor'], fitted_thresholds, condition=frame[column]
+                ).fillna(False)
+            else:
+                fitted_thresholds = self.fit_factor_thresholds(
+                    frame['factor'], (percentile_lower, percentile_upper)
+                )
+                signal_mask = self.threshold_signal(frame['factor'], fitted_thresholds).fillna(False)
+        else:
+            fitted_thresholds = pd.Series(thresholds)
+            if len(condition_columns) > 1:
+                raise ValueError('fixed-threshold timeline metrics support at most one condition')
+            condition_series = frame[condition_columns[0][0]] if condition_columns else None
+            signal_mask = self.threshold_signal(
+                frame['factor'], fitted_thresholds, condition=condition_series
+            ).fillna(False)
         frame['factor_percentile'] = frame['factor'].rank(method='first', pct=True) * 100
-        signal_mask = frame['factor_percentile'].between(
-            percentile_lower,
-            percentile_upper,
-            inclusive='both',
-        )
         events = frame.loc[signal_mask].copy()
         events.index.name = 'date'
         events.attrs['condition_summary'] = pd.DataFrame(condition_summary)
@@ -3017,13 +3142,13 @@ class TXAnalyzer:
             f'<br>Factor percentile {percentile_context}: %{{text:.1f}}%<extra></extra>'
         )
 
-        positions = pd.Series(0.0, index=self.df.index)
-        positions.loc[frame.index] = signal_mask.astype(float) * position
-        strategy_returns = (self.df[return_column] * positions).fillna(0.0)
-        turnover = positions.diff().abs().fillna(positions.abs())
-        metrics = pd.Series(self._calculate_metrics(strategy_returns.copy()))
-        metrics['Annual Turnover'] = turnover.mean() * 252
+        positions = pd.DataFrame(0.0, index=self.df.index, columns=['pos_day', 'pos_night'])
+        positions.loc[frame.index[signal_mask], f'pos_{session}'] = position
+        backtest = self.evaluate(positions, one_way_cost=one_way_cost)
+        metrics = self.summarize_result(backtest, return_column='strat_ret')
         events.attrs['metrics'] = metrics
+        events.attrs['thresholds'] = fitted_thresholds
+        events.attrs['backtest'] = backtest
 
         monthly_index = pd.date_range(frame.index.min().to_period('M').to_timestamp(), frame.index.max().to_period('M').to_timestamp(), freq='MS')
         monthly_count = events.resample('MS').size().reindex(monthly_index, fill_value=0)
@@ -3291,6 +3416,182 @@ class TXAnalyzer:
             result = result.loc[result.index <= pd.Timestamp(end)]
         return result
 
+    def evaluate_threshold_rules(
+        self,
+        factors: pd.DataFrame,
+        rules: dict[str, dict],
+        *,
+        one_way_cost: float = 0.0,
+    ) -> pd.DataFrame:
+        """Backtest fixed factor thresholds for day and/or night sessions.
+
+        Parameters
+        ----------
+        factors:
+            Date-indexed factor table. Its index must be the trading close date.
+        rules:
+            A mapping with optional ``day`` and ``night`` entries. Each entry
+            needs ``factor`` (a column in ``factors``), ``thresholds`` (the
+            Series/dict returned by :meth:`fit_factor_thresholds`), and
+            ``position`` (normally ``1.0`` or ``-1.0``).  If the thresholds
+            include a volatility condition, supply ``condition`` with the
+            corresponding factor-column name.
+
+        Returns
+        -------
+        DataFrame
+            Daily factor values, boolean signals, positions, gross/net return,
+            transaction cost, and strategy/benchmark equity curves.
+
+        Notes
+        -----
+        This function never fits thresholds. Fit them on the training set only,
+        then pass the fixed values here for validation and test evaluation.
+        """
+        # Accept the original notebook's factor-name keys as aliases so older
+        # notebooks can call this wrapper without first renaming their rules.
+        session_aliases = {
+            'ma_divergence': 'day',
+            'day_divergence': 'day',
+            # Night-session factors are known after the night close and before
+            # the same-date day open, so their default tradable session is day.
+            'night_ret': 'day',
+            'night_ret_divergence': 'day',
+            'night_divergence': 'day',
+        }
+        # A mapping key is only a user-facing rule name.  Infer the tradable
+        # session from an explicit ``session`` field first, then from the
+        # factor name, so names such as ``long_night_ret_divergence`` work.
+        normalized_rules = []
+        for name, rule in rules.items():
+            if not isinstance(rule, dict):
+                raise TypeError(f'{name} rule must be a dictionary')
+            factor_name = rule.get('factor')
+            session = rule.get('session')
+            if session is None:
+                session = session_aliases.get(factor_name, session_aliases.get(name, name))
+            normalized_rules.append((session, name, rule))
+        unsupported = {session for session, _, _ in normalized_rules} - {'day', 'night'}
+        if unsupported:
+            raise ValueError(f"rules only supports 'day' and 'night': {sorted(unsupported)}")
+        factor_frame = factors.copy()
+        factor_frame.index = pd.to_datetime(factor_frame.index).normalize()
+        if factor_frame.index.duplicated().any():
+            raise ValueError('factors must contain at most one row per trading date')
+
+        positions = pd.DataFrame(0.0, index=factor_frame.index, columns=['pos_day', 'pos_night'])
+        signals = pd.DataFrame(False, index=factor_frame.index, columns=['signal_day', 'signal_night'])
+        for session, rule_name, rule in normalized_rules:
+            required = {'factor', 'thresholds', 'position'}
+            missing = required - set(rule)
+            if missing:
+                raise ValueError(f"{session} rule missing: {sorted(missing)}")
+            factor_name = rule['factor']
+            if factor_name not in factor_frame:
+                raise KeyError(f"{session} factor not found: {factor_name}")
+            thresholds = pd.Series(rule['thresholds'])
+            condition_name = rule.get('condition')
+            condition = None if condition_name is None else factor_frame[condition_name]
+            signal = self.threshold_signal(factor_frame[factor_name], thresholds, condition=condition).fillna(False)
+            position = float(rule['position'])
+            position_column = f'pos_{session}'
+            signal_column = f'signal_{session}'
+            overlapping_opposite_position = (
+                signal & signals[signal_column] & positions[position_column].ne(position)
+            )
+            if overlapping_opposite_position.any():
+                dates = overlapping_opposite_position.index[overlapping_opposite_position].strftime('%Y-%m-%d').tolist()
+                raise ValueError(f"conflicting {session}-session positions on overlapping rules: {dates[:5]}")
+            # Multiple same-direction rules are combined with OR: an overlap
+            # remains one position, not two units of exposure.
+            signals[signal_column] |= signal
+            positions.loc[signal, position_column] = position
+            signals[f'signal_{rule_name}'] = signal
+
+        return self.evaluate(positions, one_way_cost=one_way_cost).join(factor_frame).join(signals)
+
+    def backtest_threshold_rules(
+        self,
+        factors: pd.DataFrame,
+        rules: dict[str, dict],
+        split_dates: dict[str, pd.Timestamp],
+        *,
+        one_way_cost: float = 0.0,
+        title: str = 'Factor threshold backtest: test period',
+        plot_period: str = 'test',
+        show: bool = True,
+    ) -> dict[str, pd.DataFrame | go.Figure | dict[str, go.Figure]]:
+        """Run a threshold backtest and present train/test metrics plus the test chart.
+
+        This notebook-facing wrapper combines threshold evaluation, train/test
+        performance calculation, and requested equity curves. ``split_dates``
+        needs only ``train_end`` and ``test_start``. ``plot_period`` may be
+        ``'train'``, ``'test'`` (default), ``'both'``, or ``'none'``.
+        """
+        required_splits = {'train_end', 'test_start'}
+        missing_splits = required_splits - set(split_dates)
+        if missing_splits:
+            raise ValueError(f"split_dates missing: {sorted(missing_splits)}")
+        if plot_period not in {'train', 'test', 'both', 'none'}:
+            raise ValueError("plot_period must be 'train', 'test', 'both', or 'none'")
+
+        result = self.evaluate_threshold_rules(factors, rules, one_way_cost=one_way_cost)
+        train = result.loc[:split_dates['train_end']].copy()
+        test = result.loc[split_dates['test_start']:].copy()
+        performance = pd.DataFrame({
+            'Train Strategy': self.summarize_result(train, return_column='strat_ret'),
+            'Train Benchmark': self.summarize_result(train, return_column='benchmark_ret'),
+            'Test Strategy': self.summarize_result(test, return_column='strat_ret'),
+            'Test Benchmark': self.summarize_result(test, return_column='benchmark_ret'),
+        }).T
+        # Benchmark is a passive fully invested comparison, so it has no
+        # strategy turnover even though the shared result frame records it.
+        performance.loc[['Train Benchmark', 'Test Benchmark'], 'Annual Turnover'] = 0.0
+        if show:
+            display(performance)
+        figures = {}
+        if plot_period in {'train', 'both'}:
+            figures['train'] = self.plot_equity_curve(
+                train,
+                title=title.replace('test period', 'training period'),
+                show=show,
+            )
+        if plot_period in {'test', 'both'}:
+            figures['test'] = self.plot_equity_curve(test, title=title, show=show)
+        return {
+            'result': result,
+            'train': train,
+            'test': test,
+            'performance': performance,
+            'figures': figures,
+        }
+
+    @staticmethod
+    def plot_equity_curve(
+        result: pd.DataFrame,
+        *,
+        title: str = 'Factor threshold backtest',
+        show: bool = True,
+    ) -> go.Figure:
+        """Build an interactive strategy-versus-benchmark equity chart."""
+        required = {'equity_strat', 'equity_benchmark'}
+        missing = required - set(result.columns)
+        if missing:
+            raise KeyError(f"result missing equity columns: {sorted(missing)}")
+        equity = result.loc[:, ['equity_strat', 'equity_benchmark']].copy()
+        if equity.empty:
+            raise ValueError('cannot plot an empty result')
+        # A sliced test period inherits cumulative equity from the full sample.
+        # Rebase both series so the comparison always starts at growth-of-$1.
+        equity = equity.div(equity.iloc[0])
+        fig = go.Figure()
+        fig.add_scatter(x=equity.index, y=equity['equity_strat'], mode='lines', name='Strategy (net)')
+        fig.add_scatter(x=equity.index, y=equity['equity_benchmark'], mode='lines', name='Buy & hold')
+        fig.update_layout(title=title, template='plotly_white', yaxis_title='Growth of $1')
+        if show:
+            fig.show()
+        return fig
+
     def summarize_result(
         self,
         result: pd.DataFrame,
@@ -3334,13 +3635,16 @@ class TXAnalyzer:
         )
         if point_version:
             df['gross_ret'] = df['pos_day'] * df['daily_pnl'] + df['pos_night'] * df['daily_pnl_a']
-            df['benchmark_ret'] = df['daily_pnl'] + df['daily_pnl_a']
+            df['benchmark_ret'] = df['Close'].diff()
         else:
             df['gross_ret'] = (
                 (1 + df['pos_day'] * df['daily_ret'])
                 * (1 + df['pos_night'] * df['daily_ret_a']) - 1
             )
-            df['benchmark_ret'] = (1 + df['daily_ret']) * (1 + df['daily_ret_a']) - 1
+            # Continuous Buy & Hold: previous trading-day day close to the
+            # current day close. This includes overnight and session-opening
+            # gaps, unlike multiplying two intraday open-to-close returns.
+            df['benchmark_ret'] = df['Close'].pct_change()
         df['cost'] = df['turnover'] * one_way_cost
         df['strat_ret'] = df['gross_ret'] - df['cost']
         if point_version:
