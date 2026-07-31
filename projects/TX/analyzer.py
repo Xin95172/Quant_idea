@@ -927,8 +927,9 @@ class TXAnalyzer:
             self.add_option_signals(read_frame(TW_OPTIONS_INSTITUTION_DAY), read_frame(TW_OPTIONS_INSTITUTION_NIGHT))
         df = self.df.copy()
         if trading_session == 'day':
-            factor = df[f'{indicator}_a'].rolling(window).mean() if window > 1 else df[f'{indicator}_a']
-            factor_name = f'{indicator}_day' if window == 1 else f'{indicator}_day_w{window}'
+            raw = df[f'{indicator}_a']
+            factor = (raw / raw.rolling(window).mean()) - 1 if window > 1 else raw
+            factor_name = f'{indicator}_day' if window == 1 else f'{indicator}_day_div{window}'
             result = self._handle_indicator_output(factor, name=factor_name, return_series=return_series, add_to_df=add_to_df, percentile=percentile, side=side)
             if result is not None:
                 return result
@@ -937,7 +938,7 @@ class TXAnalyzer:
             df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
             df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
             df['cum_daily_ret'] = df['daily_ret'].cumsum()
-            
+            return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry=factor_name, sub_ly=['cum_daily_ret'], title=factor_name)
         elif trading_session == 'night':
             df['pos_continue'] = df[indicator] + df[f'{indicator}_a'] + df[f'{indicator}'].shift(1)
             df['pos_continue'] = df['pos_continue'].shift(1)
