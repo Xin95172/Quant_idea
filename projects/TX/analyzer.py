@@ -919,7 +919,7 @@ class TXAnalyzer:
             df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
             return plot.plot(df, ly=['cum_demeaned_daily_ret_a'], ry='SkewSlope', sub_ly=['cum_daily_ret_a'], title='option_iv_day')
     
-    def indicator_opt_position(self, indicator: str = 'foreign_opt_pos_divergence', trading_session: str = 'day', time_series_analysis: bool = False, *, return_series: bool = False, add_to_df: bool = False, percentile: float | None = None, side: str = 'low'):
+    def indicator_opt_position(self, indicator: str = 'foreign_opt_pos_divergence', trading_session: str = 'day', window: int = 1, time_series_analysis: bool = False, *, return_series: bool = False, add_to_df: bool = False, percentile: float | None = None, side: str = 'low'):
         # foreign_opt_pos_divergence, Dealer_Opt_Signal
         # signal 代表，每一塊錢中，有多少做多(> 0) / 做空(< 0)
         if {indicator, f'{indicator}_a'} - set(self.df.columns):
@@ -927,10 +927,13 @@ class TXAnalyzer:
             self.add_option_signals(read_frame(TW_OPTIONS_INSTITUTION_DAY), read_frame(TW_OPTIONS_INSTITUTION_NIGHT))
         df = self.df.copy()
         if trading_session == 'day':
-            result = self._handle_indicator_output(df[f'{indicator}_a'], name=f'{indicator}_day', return_series=return_series, add_to_df=add_to_df, percentile=percentile, side=side)
+            factor = df[f'{indicator}_a'].rolling(window).mean() if window > 1 else df[f'{indicator}_a']
+            factor_name = f'{indicator}_day' if window == 1 else f'{indicator}_day_w{window}'
+            result = self._handle_indicator_output(factor, name=factor_name, return_series=return_series, add_to_df=add_to_df, percentile=percentile, side=side)
             if result is not None:
                 return result
-            df = df.sort_values(by=f'{indicator}_a').reset_index(drop=True)
+            df[factor_name] = factor
+            df = df.sort_values(by=factor_name).reset_index(drop=True)
             df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
             df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
             df['cum_daily_ret'] = df['daily_ret'].cumsum()
