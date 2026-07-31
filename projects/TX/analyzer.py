@@ -35,7 +35,7 @@ class StrategyEngine:
 
     REQUIRED_COLUMNS = {
         'futures_id', 'Open', 'Close', 'Close_a', 'MOVE_open', 'MOVE_high', 'MOVE_low', 'MOVE_close',
-        'SOX_open', 'SOX_close', 'Foreign_Opt_Signal_a',
+        'SOX_open', 'SOX_close', 'foreign_opt_pos_divergence_a',
     }
 
     @classmethod
@@ -68,7 +68,7 @@ class StrategyEngine:
 
         move_below_threshold = df['MOVE_ind'] < config.move_threshold
         sox_below_threshold = df['SOX_ind'] < config.sox_threshold
-        foreign_option_bearish = df['Foreign_Opt_Signal_a'] < config.foreign_option_threshold
+        foreign_option_bearish = df['foreign_opt_pos_divergence_a'] < config.foreign_option_threshold
 
         base_gap_supports_long = df['gap'] < config.gap_threshold
         base_divergence_supports_long = df['divergence'] < config.divergence_threshold
@@ -460,7 +460,7 @@ class TXAnalyzer:
         def build_long_form_signal(frame: pd.DataFrame, suffix: str = '') -> pd.DataFrame:
             if frame.empty:
                 return pd.DataFrame(columns=[
-                    f'Foreign_Opt_Signal{suffix}', f'Dealer_Opt_Signal{suffix}',
+                    f'foreign_opt_pos_divergence{suffix}', f'Dealer_Opt_Signal{suffix}',
                 ])
 
             missing_columns = long_form_columns - set(frame.columns)
@@ -492,7 +492,7 @@ class TXAnalyzer:
                 return (net_call - net_put) / (call_turnover + put_turnover).replace(0, np.nan)
 
             return pd.DataFrame({
-                f'Foreign_Opt_Signal{suffix}': signal_for('Foreign'),
+                f'foreign_opt_pos_divergence{suffix}': signal_for('Foreign'),
                 f'Dealer_Opt_Signal{suffix}': signal_for('Dealer'),
             })
 
@@ -501,7 +501,7 @@ class TXAnalyzer:
 
         # Legacy day/night schemas retained for existing historical notebooks.
         if day_df.empty:
-            day_signal = pd.DataFrame(columns=['Foreign_Opt_Signal', 'Dealer_Opt_Signal'])
+            day_signal = pd.DataFrame(columns=['foreign_opt_pos_divergence', 'Dealer_Opt_Signal'])
         else:
             required_columns = {'date', 'call_put', 'institutional_investors', 'long_deal_amount', 'short_deal_amount'}
             missing_columns = required_columns - set(day_df.columns)
@@ -521,10 +521,10 @@ class TXAnalyzer:
                 put_turnover = pivot.get(('turnover', institution, 'PUT'), pd.Series(0, index=pivot.index))
                 return (net_call - net_put) / (call_turnover + put_turnover).replace(0, np.nan)
 
-            day_signal = pd.DataFrame({'Foreign_Opt_Signal': legacy_signal_for('外資'), 'Dealer_Opt_Signal': legacy_signal_for('自營商')})
+            day_signal = pd.DataFrame({'foreign_opt_pos_divergence': legacy_signal_for('外資'), 'Dealer_Opt_Signal': legacy_signal_for('自營商')})
 
         if night_df.empty:
-            night_signal = pd.DataFrame(columns=['Foreign_Opt_Signal_a'])
+            night_signal = pd.DataFrame(columns=['foreign_opt_pos_divergence_a'])
         else:
             required_columns = {'foreign_long_call_amount', 'foreign_short_call_amount', 'foreign_long_put_amount', 'foreign_short_put_amount'}
             missing_columns = required_columns - set(night_df.columns)
@@ -535,7 +535,7 @@ class TXAnalyzer:
             net_call = night_data['foreign_long_call_amount'] - night_data['foreign_short_call_amount']
             net_put = night_data['foreign_long_put_amount'] - night_data['foreign_short_put_amount']
             turnover = night_data[list(required_columns)].sum(axis=1).replace(0, np.nan)
-            night_signal = pd.DataFrame({'Foreign_Opt_Signal_a': (net_call - net_put) / turnover})
+            night_signal = pd.DataFrame({'foreign_opt_pos_divergence_a': (net_call - net_put) / turnover})
 
         return day_signal.join(night_signal, how='outer')
 
@@ -670,7 +670,7 @@ class TXAnalyzer:
         """Summarize feature availability before analysis or backtesting."""
         if columns is None:
             columns = [
-                'MOVE_open', 'SOX_open', 'Foreign_Opt_Signal_a',
+                'MOVE_open', 'SOX_open', 'foreign_opt_pos_divergence_a',
                 'SkewSlope', 'fear_greed', 'US_bond_5y',
             ]
 
@@ -800,7 +800,7 @@ class TXAnalyzer:
         df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
         return plot.plot(df, ly='cum_demeaned_daily_ret_a', x='index', ry = 'daily_ret', sub_ly=['cum_daily_ret_a'])
 
-    def indicator_gap_days(self, after_holiday: bool = False, *, sub_analysis: bool = False, return_series: bool = False, add_to_df: bool = False, percentile: float | None = None, side: str = 'low'):
+    def indicator_gap_days(self, after_holiday: bool = False, *, return_series: bool = False, add_to_df: bool = False, percentile: float | None = None, side: str = 'low'):
         df = self.df.copy()
 
         # Calendar
@@ -831,26 +831,6 @@ class TXAnalyzer:
         df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
         df['cum_daily_ret'] = df['daily_ret'].cumsum()
 
-        if sub_analysis:
-            df['pos_day'] = 0
-            df = df.loc[df['gap'] > 2].copy()
-            df['3_ma'] = df['Close_a'].rolling(3).mean()
-            df['divergence'] = (df['Close_a'] / df['3_ma']) - 1
-            foreign_opt_short = df['Foreign_Opt_Signal'] < -0.0035 # option 偏空
-            condition_day = ~foreign_opt_short & (df['divergence'] > -0.05)
-            df.loc[condition_day, 'pos_day'] = 1.0
-            
-            df = df.sort_values(by='pos_day').reset_index(drop=True)
-            
-            # 重算累積報酬 (因為 filter 過了)
-            df['demeaned_daily_ret_a'] = df['daily_ret_a'] - df['daily_ret_a'].mean()
-            df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
-            df['cum_demeaned_daily_ret_a'] = df['demeaned_daily_ret_a'].cumsum()
-            df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
-            df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
-            df['cum_daily_ret'] = df['daily_ret'].cumsum()
-            
-            return plot.plot(df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='pos_day', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title='gap_days_after_holiday')
 
         period = 'after_holiday' if after_holiday else 'before_holiday'
         return plot.plot(df, ly=['cum_demeaned_daily_ret_a', 'cum_demeaned_daily_ret'], ry='gap', sub_ly=['cum_daily_ret_a', 'cum_daily_ret'], title=f'gap_days_{period}')
@@ -913,7 +893,7 @@ class TXAnalyzer:
             title='margin_utilization',
         )
 
-    def indicator_option_iv(self, sub_analysis: bool = False, trading_session: str = 'day', *, return_series: bool = False, add_to_df: bool = False, percentile: float | None = None, side: str = 'low'):
+    def indicator_option_iv(self, trading_session: str = 'day', *, return_series: bool = False, add_to_df: bool = False, percentile: float | None = None, side: str = 'low'):
         if {'SkewSlope', 'SkewSlope_a'} - set(self.df.columns):
             from cloud_data import TW_OPTIONS_SETTLE_TXO, TW_OPTIONS_TXO, read_frame
             from module.options.option_tools import compute_iv
@@ -939,8 +919,8 @@ class TXAnalyzer:
             df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
             return plot.plot(df, ly=['cum_demeaned_daily_ret_a'], ry='SkewSlope', sub_ly=['cum_daily_ret_a'], title='option_iv_day')
     
-    def indicator_opt_position(self, indicator: str = 'Foreign_Opt_Signal', trading_session: str = 'day', sub_analysis: bool = False, time_series_analysis: bool = False, *, return_series: bool = False, add_to_df: bool = False, percentile: float | None = None, side: str = 'low'):
-        # Foreign_Opt_Signal, Dealer_Opt_Signal
+    def indicator_opt_position(self, indicator: str = 'foreign_opt_pos_divergence', trading_session: str = 'day', time_series_analysis: bool = False, *, return_series: bool = False, add_to_df: bool = False, percentile: float | None = None, side: str = 'low'):
+        # foreign_opt_pos_divergence, Dealer_Opt_Signal
         # signal 代表，每一塊錢中，有多少做多(> 0) / 做空(< 0)
         if {indicator, f'{indicator}_a'} - set(self.df.columns):
             from cloud_data import TW_OPTIONS_INSTITUTION_DAY, TW_OPTIONS_INSTITUTION_NIGHT, read_frame
@@ -955,26 +935,6 @@ class TXAnalyzer:
             df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
             df['cum_daily_ret'] = df['daily_ret'].cumsum()
             
-            if sub_analysis:
-                df_l = df.loc[df[f'{indicator}_a'] < -0.0035]
-                df_r = df.loc[df[f'{indicator}_a'] > -0.0035]
-                for df in [df_l, df_r]:
-                    df['3ma'] = df['Close_a'].rolling(window=3).mean()
-                    df['divergence'] = (df['Close_a'] / df['3ma'] - 1)
-
-                    df['MOVE_ind'] = (df['MOVE_close'] / df['MOVE_open']) - 1
-                    
-                    df['SOX_ind'] = (df['SOX_close'] / df['SOX_open']) - 1
-                    df['SOX_ind'] = df['SOX_ind'].shift(1)
-
-                    df = df.sort_values(by='MOVE_ind').reset_index(drop=True)
-                    df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
-                    df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
-                    df['cum_daily_ret'] = df['daily_ret'].cumsum()
-                    plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='MOVE_ind', sub_ly=['cum_daily_ret'], title=f'option_position_day_{indicator}_move_split')
-            else:
-                return plot.plot(df, ly=['cum_demeaned_daily_ret'], ry=f'{indicator}_a', sub_ly=['cum_daily_ret'], title=f'option_position_day_{indicator}')
-
         elif trading_session == 'night':
             df['pos_continue'] = df[indicator] + df[f'{indicator}_a'] + df[f'{indicator}'].shift(1)
             df['pos_continue'] = df['pos_continue'].shift(1)
@@ -997,7 +957,7 @@ class TXAnalyzer:
     def check_volatility(self, window: int = 20):
         """
         事件變數 + 事件前 window 天波動度分佈（PDF）
-        pos_continue_t = Foreign_Opt_Signal_t + Foreign_Opt_Signal_a_t + Foreign_Opt_Signal_{t-1}
+        pos_continue_t = foreign_opt_pos_divergence_t + foreign_opt_pos_divergence_a_t + foreign_opt_pos_divergence_{t-1}
         sig_lag_t      = pos_continue_{t-1}
         event_t        = (sig_lag_t >= 0.012)
         """
@@ -1005,7 +965,7 @@ class TXAnalyzer:
         ret_col = 'daily_ret_a'
 
         # 訊號與事件
-        df['pos_continue'] = df['Foreign_Opt_Signal'] + df['Foreign_Opt_Signal_a'] + df['Foreign_Opt_Signal'].shift(1)
+        df['pos_continue'] = df['foreign_opt_pos_divergence'] + df['foreign_opt_pos_divergence_a'] + df['foreign_opt_pos_divergence'].shift(1)
         df['sig_lag'] = df['pos_continue'].shift(1)
         th = 0.012
         df['event'] = (df['sig_lag'] >= th)
@@ -1027,7 +987,7 @@ class TXAnalyzer:
             print(first_20)
 
         # Sanity check：確認 lag 與報酬無前視
-        sample = df[['Foreign_Opt_Signal', 'Foreign_Opt_Signal_a', 'pos_continue', 'sig_lag', 'event', ret_col]].head(5)
+        sample = df[['foreign_opt_pos_divergence', 'foreign_opt_pos_divergence_a', 'pos_continue', 'sig_lag', 'event', ret_col]].head(5)
         print("[sanity] sample (check shifts):")
         print(sample)
 
@@ -1407,7 +1367,6 @@ class TXAnalyzer:
     # =========================================================================
     def indicator_night_ret(
         self,
-        sub_analysis: bool = False,
         window: int = 3,
         *,
         return_series: bool = False,
@@ -1416,8 +1375,6 @@ class TXAnalyzer:
         side: str = 'low',
     ):
         """Plot or return night-session close divergence from its trailing MA."""
-        if sub_analysis and (return_series or add_to_df or percentile is not None):
-            raise ValueError('sub_analysis cannot be used with return_series, add_to_df, or percentile')
         if window < 2:
             raise ValueError('window must be at least 2')
         df = self.df.copy()
@@ -1428,16 +1385,7 @@ class TXAnalyzer:
         result = self._handle_indicator_output(df['divergence'], name=factor_name, return_series=return_series, add_to_df=add_to_df, percentile=percentile, side=side)
         if result is not None:
             return result
-        if sub_analysis:
-            df_l = df.loc[df['divergence'] < 0]
-            df_r = df.loc[df['divergence'] >= 0]
-            for df in [df_l, df_r]:
-                df = df.sort_values(by='Foreign_Opt_Signal_a').reset_index(drop=True)
-                df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
-                df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
-                df['cum_daily_ret'] = df['daily_ret'].cumsum()
-                plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='Foreign_Opt_Signal_a', sub_ly=['cum_daily_ret'])
-            return
+
         df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
         df = df.sort_values(by='divergence').reset_index(drop=True)
         df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
@@ -1537,7 +1485,7 @@ class TXAnalyzer:
         )
         fig.show()
 
-    def indicator_US_bond(self, indicator: str, sub_analysis: bool = False, *, return_series: bool = False, add_to_df: bool = False, percentile: float | None = None, side: str = 'low'):
+    def indicator_US_bond(self, indicator: str, *, return_series: bool = False, add_to_df: bool = False, percentile: float | None = None, side: str = 'low'):
         import numpy as np
         temp_df = self.df.copy()
         ind_list = [
@@ -1636,7 +1584,7 @@ class TXAnalyzer:
         elif trading_session == 'day':
             return plot.plot(df, ly=['cum_demean_daily_ret'], ry='delta_fear_greed', sub_ly=['cum_daily_ret'], title='fear_greed_day')
 
-    def indicator_move(self, trading_session: str, sub_analysis: bool = False, *, return_series: bool = False, add_to_df: bool = False, percentile: float | None = None, side: str = 'low'):
+    def indicator_move(self, trading_session: str, *, return_series: bool = False, add_to_df: bool = False, percentile: float | None = None, side: str = 'low'):
         if 'MOVE_open' not in self.df:
             from cloud_data import MARKET_MOVE_DAILY, read_frame
             self.add_market_ohlc(read_frame(MARKET_MOVE_DAILY), 'MOVE')
@@ -1677,102 +1625,15 @@ class TXAnalyzer:
             df = df.sort_values(by='MOVE_vol').reset_index(drop=True)
             df['cum_demean_daily_ret_a'] = df['demean_daily_ret_a'].cumsum()
             df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
-            plot.plot(df, ly=['cum_demean_daily_ret_a'], ry='MOVE_vol', sub_ly=['cum_daily_ret_a'], title='move_night')
-
-            print("==================\n==================")
-
-            if sub_analysis:
-                df_l, df_r = df.loc[df['MOVE_vol'] < 0.0145], df.loc[df['MOVE_vol'] >= 0.0145]
-
-                lt = [df_l, df_r]
-
-                for idx, df in enumerate(lt):
-                    if idx == 0:
-                        df = df.sort_values(by='ind').reset_index(drop=True)
-                        df['demean_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
-                        df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
-                        df['cum_daily_ret'] = df['daily_ret'].cumsum()
-                        plot.plot(df, ly=['cum_demean_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'])
-
-                        sub_df_ll, sub_df_lr = df.loc[df['MOVE_divergence'] < 0.0075].copy(), df.loc[df['MOVE_divergence'] >= 0.0075].copy()
-                        # sub_df_ll, sub_df_lr = df.loc[df['SOX_ind'] < -0.0043].copy(), df.loc[df['SOX_ind'] >= -0.0043].copy()
-
-                        # for sub_df in [sub_df_ll, sub_df_lr]:
-                        #     sub_df = sub_df.sort_values(by='gap')
-                        #     sub_df['demean_daily_ret'] = sub_df['daily_ret'] - sub_df['daily_ret'].mean()
-                        #     sub_df['cum_demean_daily_ret'] = sub_df['demean_daily_ret'].cumsum()
-                        #     sub_df['cum_daily_ret'] = sub_df['daily_ret'].cumsum()
-                        #     plot.plot(sub_df, ly=['cum_demean_daily_ret'], ry='gap', sub_ly=['cum_daily_ret'])
-
-                    elif idx == 1:
-                        df = df.sort_values(by='ind').reset_index(drop=True)
-                        df['demean_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
-                        df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
-                        df['cum_daily_ret'] = df['daily_ret'].cumsum()
-                        plot.plot(df, ly=['cum_demean_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'])
-
-                        sub_df_rl, sub_df_rr = df.loc[df['MOVE_divergence'] < -0.0035].copy(), df.loc[df['MOVE_divergence'] >= -0.0035].copy()
-
-                        # for sub_df in [sub_df_rl, sub_df_rr]:
-                        #     sub_df = sub_df.sort_values(by='divergence')
-                        #     sub_df['demean_daily_ret'] = sub_df['daily_ret'] - sub_df['daily_ret'].mean()
-                        #     sub_df['cum_demean_daily_ret'] = sub_df['demean_daily_ret'].cumsum()
-                        #     sub_df['cum_daily_ret'] = sub_df['daily_ret'].cumsum()
-                        #     plot.plot(sub_df, ly=['cum_demean_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret'])
-
-                    print("----------------------------")
+            return plot.plot(df, ly=['cum_demean_daily_ret_a'], ry='MOVE_vol', sub_ly=['cum_daily_ret_a'], title='move_night')
 
         elif trading_session == 'day':
             df = df.sort_values(by='ind').reset_index(drop=True)
             df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
             df['cum_daily_ret'] = df['daily_ret'].cumsum()
-            plot.plot(df, ly=['cum_demean_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'], title='move_day')
+            return plot.plot(df, ly=['cum_demean_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'], title='move_day')
 
-            print("==================\n==================")
-
-            if sub_analysis:
-                df_l = df.loc[df['ind'] < 0.0001].copy()
-                df_r = df.loc[df['ind'] >= 0.0001].copy()
-
-                lt = [df_l, df_r]
-
-                for idx, df in enumerate(lt):
-                    if idx == 0:
-                        df = df.sort_values(by='SOX_ind')
-                        df['demean_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
-                        df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
-                        df['cum_daily_ret'] = df['daily_ret'].cumsum()
-                        plot.plot(df, ly=['cum_demean_daily_ret'], ry='SOX_ind', sub_ly=['cum_daily_ret'])
-
-                        sub_df_ll, sub_df_lr = df.loc[df['SOX_ind'] < 0.0075].copy(), df.loc[df['SOX_ind'] >= 0.0075].copy()
-                        # sub_df_ll, sub_df_lr = df.loc[df['SOX_ind'] < -0.0043].copy(), df.loc[df['SOX_ind'] >= -0.0043].copy()
-
-                        for sub_df in [sub_df_ll, sub_df_lr]:
-                            sub_df = sub_df.sort_values(by='gap')
-                            sub_df['demean_daily_ret'] = sub_df['daily_ret'] - sub_df['daily_ret'].mean()
-                            sub_df['cum_demean_daily_ret'] = sub_df['demean_daily_ret'].cumsum()
-                            sub_df['cum_daily_ret'] = sub_df['daily_ret'].cumsum()
-                            plot.plot(sub_df, ly=['cum_demean_daily_ret'], ry='gap', sub_ly=['cum_daily_ret'])
-
-                    elif idx == 1:
-                        df = df.sort_values(by='Foreign_Opt_Signal_a')
-                        df['demean_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
-                        df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
-                        df['cum_daily_ret'] = df['daily_ret'].cumsum()
-                        plot.plot(df, ly=['cum_demean_daily_ret'], ry='Foreign_Opt_Signal_a', sub_ly=['cum_daily_ret'])
-
-                        sub_df_rl, sub_df_rr = df.loc[df['Foreign_Opt_Signal_a'] < -0.0035].copy(), df.loc[df['Foreign_Opt_Signal_a'] >= -0.0035].copy()
-
-                        for sub_df in [sub_df_rl, sub_df_rr]:
-                            sub_df = sub_df.sort_values(by='divergence')
-                            sub_df['demean_daily_ret'] = sub_df['daily_ret'] - sub_df['daily_ret'].mean()
-                            sub_df['cum_demean_daily_ret'] = sub_df['demean_daily_ret'].cumsum()
-                            sub_df['cum_daily_ret'] = sub_df['daily_ret'].cumsum()
-                            plot.plot(sub_df, ly=['cum_demean_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret'])
-
-                    print("----------------------------")
-
-    def indicator_sox(self, trading_session: str, sub_analysis: bool = False, *, return_series: bool = False, add_to_df: bool = False, percentile: float | None = None, side: str = 'low'):
+    def indicator_sox(self, trading_session: str, *, return_series: bool = False, add_to_df: bool = False, percentile: float | None = None, side: str = 'low'):
         if 'SOX_open' not in self.df:
             from cloud_data import MARKET_SOX_DAILY, read_frame
             self.add_market_ohlc(read_frame(MARKET_SOX_DAILY), 'SOX')
@@ -1794,191 +1655,20 @@ class TXAnalyzer:
         df['demean_daily_ret_a'] = df['daily_ret_a'] - df['daily_ret_a'].mean()
         df['demean_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
         # df.dropna(subset=['ind'], inplace=True)
-        if not sub_analysis:
-            if trading_session == 'night':
-                df['ind'] = df['ind'].shift(1)
-                df = df.sort_values(by='ind').reset_index(drop=True)
-                df['cum_demean_daily_ret_a'] = df['demean_daily_ret_a'].cumsum()
-                df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
-                return plot.plot(df, ly=['cum_demean_daily_ret_a'], ry='ind', sub_ly=['cum_daily_ret_a'], title='sox_night')
-            elif trading_session == 'day':
-                df = df.sort_values(by='ind').reset_index(drop=True)
-                df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
-                df['cum_daily_ret'] = df['daily_ret'].cumsum()
-                mean_l = df.loc[df['ind'] < 0.0025, 'daily_ret'].mean()
-                mean_r = df.loc[df['ind'] >= 0.0025, 'daily_ret'].mean()
-                print(f"SOX ind threshold=0.0025\nmean_l={mean_l:.6f} | mean_r={mean_r:.6f}")
-                return plot.plot(df, ly=['cum_demean_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'], title='sox_day')
-        
-        # # sub 1：SOX 優先
-        # if sub_analysis:
-        #     # df_l = df.loc[df['ind'] < 0.0025].copy()
-        #     df_l = df.loc[df['ind'] < 0.0095].copy()
-        #     df_ll = df_l.loc[df['Foreign_Opt_Signal_a'] < -0.002].copy()
-        #     df_lr = df_l.loc[df['Foreign_Opt_Signal_a'] >= -0.002].copy()
-        #     df_r = df.loc[df['ind'] >= 0.0025].copy()
-        #     df_r = df.loc[df['ind'] >= 0.0025].copy()
-        #     df_rl = df_r.loc[df['Foreign_Opt_Signal_a'] < -0.0035].copy()
-        #     df_rr = df_r.loc[df['Foreign_Opt_Signal_a'] >= -0.0035].copy()
-        #     i = 0
-        #     for df in [df_l, df_r]:
-        #         df = df.sort_values(by='Foreign_Opt_Signal_a').reset_index(drop=True)
-        #         df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
-        #         df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
-        #         df['cum_daily_ret'] = df['daily_ret'].cumsum()
-        #         plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='Foreign_Opt_Signal_a', sub_ly=['cum_daily_ret'])
-
-        #         if i == 0:
-        #             print("--- Sub-analysis: SOX ind < 0.0025 (Left) ---")
-        #             lt = [df_ll, df_lr]
-        #             threshold_l = -999
-        #             threshold_r = -0.001
-        #         elif i == 1:
-        #             print("--- Sub-analysis: SOX ind >= 0.0025 (Right) ---")
-        #             lt = [df_rl, df_rr]
-        #             threshold_l = -0.01
-        #             threshold_r = 0.02
-
-        #         for idx, sub_df in enumerate(lt):
-        #             sub_df['3_ma'] = sub_df['Close_a'].rolling(window=3).mean()
-        #             sub_df['divergence'] = (sub_df['Close_a'] / sub_df['3_ma']) - 1
-
-        #             sub_df = sub_df.sort_values(by='divergence').reset_index(drop=True)
-        #             sub_df['demeaned_daily_ret'] = sub_df['daily_ret'] - sub_df['daily_ret'].mean()
-        #             sub_df['cum_demeaned_daily_ret'] = sub_df['demeaned_daily_ret'].cumsum()
-        #             sub_df['cum_daily_ret'] = sub_df['daily_ret'].cumsum()
-
-        #             if idx == 0:
-        #                 left_mask = sub_df['divergence'] < threshold_l
-        #                 left_mean = sub_df.loc[left_mask, 'daily_ret'].mean()
-        #                 right_mean = sub_df.loc[~left_mask, 'daily_ret'].mean()
-        #                 print(
-        #                     f"lt[0] threshold_l={threshold_l:.4f}\n"
-        #                     f"left_mean={left_mean:.6f}"
-        #                     f" | right_mean={right_mean:.6f}"
-        #                 )
-        #             else:
-        #                 right_mask = sub_df['divergence'] > threshold_r
-        #                 left_mean = sub_df.loc[~right_mask, 'daily_ret'].mean()
-        #                 right_mean = sub_df.loc[right_mask, 'daily_ret'].mean()
-        #                 print(
-        #                     f"lt[1] threshold_r={threshold_r:.4f}\n"
-        #                     f"left_mean={left_mean:.6f}"
-        #                     f" | right_mean={right_mean:.6f}"
-        #                 )
-
-        #             plot.plot(sub_df, ly=['cum_demeaned_daily_ret'], ry='divergence', sub_ly=['cum_daily_ret'])
-                
-        #         i += 1
-        #         print("=======================================================")
-        #     print("")
-
-        # # sub 2：foreign opt signal 優先
-        # if sub_analysis:
-        #     df_l = df.loc[df['Foreign_Opt_Signal_a'] < -0.0035].copy()
-        #     df_ll = df_l.loc[df_l['ind'] < 0.007].copy()
-        #     df_lr = df_l.loc[df_l['ind'] >= 0.007].copy()
-        #     df_r = df.loc[df['Foreign_Opt_Signal_a'] >= -0.0035].copy()
-        #     df_rl = df_r.loc[df_r['ind'] < -0.0035].copy()
-        #     df_rr = df_r.loc[df_r['ind'] >= -0.0035].copy()
-
-        #     i = 0
-
-        #     for df in [df_l, df_r]:
-        #         df = df.sort_values(by='ind').reset_index(drop=False)
-        #         df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
-        #         df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
-        #         df['cum_daily_ret'] = df['daily_ret'].cumsum()
-        #         plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'])
-                
-        #         if i == 0:
-        #             print("--- Sub-analysis: Foreign Opt Signal_a < -0.0035 (Left) ---")
-        #             lt = [df_ll, df_lr]
-        #         else:
-        #             print("--- Sub-analysis: Foreign Opt Signal_a >= -0.0035 (Right) ---")
-        #             lt = [df_rl, df_rr]
-
-        #         for idx, sub_df in enumerate(lt):
-        #             sub_df['MOVE_ind'] = (sub_df['MOVE_high'] / sub_df['MOVE_low']) - 1
-
-        #             sub_df = sub_df.sort_values(by='MOVE_ind').reset_index(drop=True)
-        #             sub_df['demeaned_daily_ret'] = sub_df['daily_ret'] - sub_df['daily_ret'].mean()
-        #             sub_df['cum_demeaned_daily_ret'] = sub_df['demeaned_daily_ret'].cumsum()
-        #             sub_df['cum_daily_ret'] = sub_df['daily_ret'].cumsum()
-        #             if idx == 0:
-        #                 left_mask = sub_df['MOVE_ind'] < 0.0035
-        #                 left_mean = sub_df.loc[left_mask, 'daily_ret'].mean()
-        #                 right_mean = sub_df.loc[~left_mask, 'daily_ret'].mean()
-        #                 print(
-        #                     f"lt[0] MOVE_ind threshold=0.0035\n"
-        #                     f"left_mean={left_mean:.6f}"
-        #                     f" | right_mean={right_mean:.6f}"
-        #                 )
-        #             else:
-        #                 right_mask = sub_df['MOVE_ind'] > 0.0035
-        #                 left_mean = sub_df.loc[~right_mask, 'daily_ret'].mean()
-        #                 right_mean = sub_df.loc[right_mask, 'daily_ret'].mean()
-        #                 print(
-        #                     f"lt[1] MOVE_ind threshold=0.0035\n"
-        #                     f"left_mean={left_mean:.6f}"
-        #                     f" | right_mean={right_mean:.6f}"
-        #                 )
-                    
-        #             plot.plot(sub_df, ly=['cum_demeaned_daily_ret'], ry='MOVE_ind', sub_ly=['cum_daily_ret'])
-        #         i += 1
-        #         print("=======================================================")
-        
-        # # sub 3：加入下一天跳空
-        # if sub_analysis:
-        #     df_l, df_r = df.loc[df['ind'] < -0.006].copy(), df.loc[df['ind'] >= -0.006].copy()
-        #     for df in [df_l, df_r]:
-        #         df = df.sort_values(by='gap').reset_index(drop=True)
-        #         df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
-        #         df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
-        #         df['cum_daily_ret'] = df['daily_ret'].cumsum()
-        #         plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='gap', sub_ly=['cum_daily_ret'])
-            
-        # # sub 4：permutation test
-        # if sub_analysis:
-        #     n = len(df)
-        #     df['ind'] = np.random.permutation(df['ind'].values)
-        #     df_1, df_2, df_3 = df.iloc[: int(n * 0.33)], df.iloc[int(n * 0.33): int(n * 0.66)], df.iloc[int(n * 0.66): int(n-1)]
-        #     for df in [df_1, df_2, df_3]:
-        #         df = df.sort_values(by='ind').reset_index(drop=True)
-        #         df['demeaned_daily_ret'] = df['daily_ret'] - df['daily_ret'].mean()
-        #         df['cum_demeaned_daily_ret'] = df['demeaned_daily_ret'].cumsum()
-        #         df['cum_daily_ret'] = df['daily_ret'].cumsum()
-        #         plot.plot(df, ly=['cum_demeaned_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'])
-
-        # sub 5：bootstrap test
-        if sub_analysis:
-            def robustness_shift1(df, n_iter=200, frac=0.8):
-                results = []
-
-                for _ in range(n_iter):
-                    sub = df.sample(frac=frac, replace=False).copy()
-                    sub = sub.sort_values(by='ind').reset_index(drop=True)
-
-                    q30 = sub['ind'].quantile(0.3)
-                    q70 = sub['ind'].quantile(0.7)
-
-                    low = sub.loc[sub['ind'] <= q30, 'daily_ret'].mean()
-                    high = sub.loc[sub['ind'] >= q70, 'daily_ret'].mean()
-                    spread = high - low
-
-                    results.append({
-                        'low_mean': low,
-                        'high_mean': high,
-                        'spread': spread
-                    })
-
-                return pd.DataFrame(results)
-            robust = robustness_shift1(df)
-            print(robust['spread'].describe())
-            print((robust['spread'] > 0).mean())   # 正向比例
-
-            return
-
+        if trading_session == 'night':
+            df['ind'] = df['ind'].shift(1)
+            df = df.sort_values(by='ind').reset_index(drop=True)
+            df['cum_demean_daily_ret_a'] = df['demean_daily_ret_a'].cumsum()
+            df['cum_daily_ret_a'] = df['daily_ret_a'].cumsum()
+            return plot.plot(df, ly=['cum_demean_daily_ret_a'], ry='ind', sub_ly=['cum_daily_ret_a'], title='sox_night')
+        elif trading_session == 'day':
+            df = df.sort_values(by='ind').reset_index(drop=True)
+            df['cum_demean_daily_ret'] = df['demean_daily_ret'].cumsum()
+            df['cum_daily_ret'] = df['daily_ret'].cumsum()
+            mean_l = df.loc[df['ind'] < 0.0025, 'daily_ret'].mean()
+            mean_r = df.loc[df['ind'] >= 0.0025, 'daily_ret'].mean()
+            print(f"SOX ind threshold=0.0025\nmean_l={mean_l:.6f} | mean_r={mean_r:.6f}")
+            return plot.plot(df, ly=['cum_demean_daily_ret'], ry='ind', sub_ly=['cum_daily_ret'], title='sox_day')
 
     # =========================================================================
     # Factor research tools: conditional sorts, signal timelines, and overlap
@@ -3686,7 +3376,7 @@ class TXAnalyzer:
         """Return a log that explains each active day-session position."""
         df = StrategyEngine.apply_positions(StrategyEngine.calculate_factors(self.df), self.config)
         move_below_threshold = df['MOVE_ind'] < self.config.move_threshold
-        foreign_option_bearish = df['Foreign_Opt_Signal_a'] < self.config.foreign_option_threshold
+        foreign_option_bearish = df['foreign_opt_pos_divergence_a'] < self.config.foreign_option_threshold
         divergence_supports_long = df['divergence_v2'] < self.config.divergence_threshold
 
         log = pd.DataFrame(index=df.index)
@@ -3697,7 +3387,7 @@ class TXAnalyzer:
         )
         log['Value'] = np.select(
             [move_below_threshold, foreign_option_bearish, ~divergence_supports_long],
-            [df['MOVE_ind'], df['Foreign_Opt_Signal_a'], df['divergence_v2']],
+            [df['MOVE_ind'], df['foreign_opt_pos_divergence_a'], df['divergence_v2']],
             default=np.nan,
         )
         log['Action'] = np.select(
@@ -3805,7 +3495,7 @@ class TXAnalyzer:
         
         # 定義主要因子 (若未指定 fetch default)
         if factors is None:
-            factors = ['Foreign_Opt_Signal_a', 'MOVE_ind', 'SOX_ind', 'divergence']
+            factors = ['foreign_opt_pos_divergence_a', 'MOVE_ind', 'SOX_ind', 'divergence']
         
         # 移除沒有該 flag 的情形 (例如 holiday 需要計算)
         valid_factors = [f for f in factors if f in df.columns]
