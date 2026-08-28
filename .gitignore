@@ -8,3 +8,15 @@ data/disposal/price_df.csv
 .DS_Store
 /projects/CTA/學弟策略/feature_df.parquet
 /projects/TX/rubber_band_diagnostics.xlsx
+
+# Notebooks containing credentials moved to C:/Users/user/Documents/GitHub/Data
+/projects/CTA/LLT/test.ipynb
+/projects/Pairs/get crypto info.ipynb
+/projects/TX/rubber_band.ipynb
+.env
+.env.*
+*.pem
+*.pfx
+*.p12
+*.jks
+*.keystore
